@@ -1,5 +1,6 @@
 ﻿using FlaUIRecorder.Core.Models;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 public class JsonStorageService
 {
@@ -9,7 +10,8 @@ public class JsonStorageService
     {
         var json = JsonSerializer.Serialize(steps, new JsonSerializerOptions
         {
-            WriteIndented = true
+            WriteIndented = true,
+            DefaultIgnoreCondition = JsonIgnoreCondition.Never
         });
 
         File.WriteAllText(file, json);

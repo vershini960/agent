@@ -23,6 +23,14 @@ public class ExcelReplayerService
         return FlaUIRecorder.Core.Constants.Shell.Processes.Any(s => p.Contains(s));
     }
 
+    private static bool IsSelf(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return false;
+        var p = path.ToLower();
+        // Check for common process names of this app
+        return p.Contains("flauirecorder") || p.Contains("vshost");
+    }
+
     private static void NavigateToCell(AutomationElement window, UIA3Automation automation, string cellAddress)
     {
         if (string.IsNullOrEmpty(cellAddress)) return;
@@ -55,7 +63,8 @@ public class ExcelReplayerService
         string fullLaunchPath,
         Dictionary<string, FlaUIApp> apps,
         UIA3Automation automation,
-        ref FlaUIApp currentApp)
+        ref FlaUIApp currentApp,
+        bool launchIfMissing = true)
     {
         if (string.IsNullOrEmpty(fullLaunchPath) || IsShellApp(fullLaunchPath)) return false;
 
@@ -105,6 +114,9 @@ public class ExcelReplayerService
         }
         catch { }
 
+        // 🔥 FIX: If we are just trying to CLOSE the app, don't launch it if it's already gone!
+        if (!launchIfMissing) return false;
+
         try
         {
             FlaUIApp newApp;
@@ -147,6 +159,13 @@ public class ExcelReplayerService
 
         foreach (var step in steps)
         {
+            // 🔥 SAFETY: Never replay actions on our own recorder UI (prevents loops)
+            if (IsSelf(step.AppPath))
+            {
+                Log.Warning($"[REPLAY SKIP] Skipping action on self: {step.ActionType}");
+                continue;
+            }
+
             Log.Information($"[REPLAY] {step.ActionType} | App: {step.AppPath} | Target: {step.Name} | Value: {step.Value}");
 
             if (IsShellApp(step.AppPath)) continue;
@@ -193,6 +212,13 @@ public class ExcelReplayerService
                             FlaUI.Core.Input.Keyboard.Release(VirtualKeyShort.KEY_A);
                             FlaUI.Core.Input.Keyboard.Release(VirtualKeyShort.CONTROL);
                             Thread.Sleep(FlaUIRecorder.Core.Constants.Timeouts.InteractionDelay);
+                            FlaUI.Core.Input.Keyboard.Press(VirtualKeyShort.CONTROL);
+                            FlaUI.Core.Input.Keyboard.Press(VirtualKeyShort.KEY_A);
+                            FlaUI.Core.Input.Keyboard.Release(VirtualKeyShort.KEY_A);
+                            FlaUI.Core.Input.Keyboard.Release(VirtualKeyShort.CONTROL);
+                            Thread.Sleep(100);
+                            FlaUI.Core.Input.Keyboard.Press(VirtualKeyShort.BACK);
+                            Thread.Sleep(200);
                             FlaUI.Core.Input.Keyboard.Type(step.Value);
                             Thread.Sleep(FlaUIRecorder.Core.Constants.Timeouts.ClickDelay);
                             FlaUI.Core.Input.Keyboard.Press(VirtualKeyShort.RETURN);
@@ -245,24 +271,47 @@ public class ExcelReplayerService
                                     // 1. Win32 Dialogs
                                     foreach (var dlg in dialogs)
                                     {
-                                        // 🔥 Robust search for Open button variations
+                                        // 🔥 SPECIAL: Handle the 'Open' button in file dialogs
                                         if (step.AutomationId == "1" || step.Name?.ToLower().Contains("open") == true)
                                         {
                                             targetElement = dlg.FindFirstDescendant(cf.ByAutomationId("1"))
                                                          ?? dlg.FindFirstDescendant(cf.ByName("Open"))
                                                          ?? dlg.FindFirstDescendant(cf.ByName("&Open"));
+                                            
+                                            // 🔥 Wait for button to be enabled (Windows lag)
+                                            if (targetElement != null)
+                                            {
+                                                Retry.WhileFalse(() => targetElement.Properties.IsEnabled.ValueOrDefault, TimeSpan.FromSeconds(2));
+                                            }
                                         }
                                         else if (step.ControlType == "ListItem")
                                         {
-                                            // 🔥 NEW: For file items, search by NAME first (not AutomationId)
-                                            targetElement = dlg.FindFirstDescendant(cf.ByName(step.Name));
+                                            // 🔥 ENHANCED FILE SELECTION: Support both Names and Numeric IDs
+                                            // 1. Try numeric AutomationId directly
+                                            if (!string.IsNullOrEmpty(step.AutomationId))
+                                                targetElement = dlg.FindFirstDescendant(cf.ByAutomationId(step.AutomationId));
 
-                                            // Fallback: search all list items if name didn't work
+                                            // 2. Try Name directly
+                                            if (targetElement == null && !string.IsNullOrEmpty(step.Name))
+                                                targetElement = dlg.FindFirstDescendant(cf.ByName(step.Name));
+
+                                            // 3. Deep search fallback
                                             if (targetElement == null)
                                             {
-                                                var allItems = dlg.FindAllChildren(cf.ByControlType(FlaUI.Core.Definitions.ControlType.ListItem));
-                                                targetElement = allItems.FirstOrDefault(item => item.Name?.Contains(step.Name) == true);
-                                                if (targetElement != null) Log.Information($"[FILE FOUND] {step.Name} (by name fallback)");
+                                                var allItems = dlg.FindAllDescendants(cf.ByControlType(FlaUI.Core.Definitions.ControlType.ListItem))
+                                                    .Union(dlg.FindAllDescendants(cf.ByControlType(FlaUI.Core.Definitions.ControlType.DataItem))).ToList();
+
+                                                targetElement = allItems.FirstOrDefault(el => 
+                                                    el.AutomationId == step.AutomationId || 
+                                                    el.Name == step.Name || 
+                                                    (el.Name != null && el.Name.Contains(step.Name)));
+
+                                                // 4. Index Fallback (if AutomationId is a number like '6')
+                                                if (targetElement == null && int.TryParse(step.AutomationId, out int index) && index > 0 && index <= allItems.Count)
+                                                {
+                                                    targetElement = allItems[index - 1];
+                                                    Log.Information($"[INDEX SELECT] Selected item at index {index}");
+                                                }
                                             }
                                         }
                                         else
@@ -355,10 +404,11 @@ public class ExcelReplayerService
                         try
                         {
                             var winRect = targetWindow.BoundingRectangle;
-                            int clickX, clickY;
+                            int clickX = 0, clickY = 0;
                             bool isListItem = false;
+                            bool elementFound = targetElement != null;
 
-                            if (targetElement != null)
+                            if (elementFound)
                             {
                                 var rect = targetElement.BoundingRectangle;
                                 Log.Information($"[ELEMENT CLICK] {step.Name}");
@@ -372,6 +422,16 @@ public class ExcelReplayerService
                             }
                             else
                             {
+                                // 🔥 SPECIAL FALLBACK: If we're looking for 'Open' and didn't find it, just press ENTER
+                                if (targetWindow.ClassName == FlaUIRecorder.Core.Constants.Automation.Win32DialogClass && 
+                                   (step.Name?.ToLower().Contains("open") == true || step.AutomationId == "1"))
+                                {
+                                    Log.Information("[FALLBACK] Button not found, pressing ENTER to attach");
+                                    FlaUI.Core.Input.Keyboard.Press(VirtualKeyShort.RETURN);
+                                    Thread.Sleep(FlaUIRecorder.Core.Constants.Timeouts.WindowFocusWait);
+                                    return; 
+                                }
+
                                 Log.Information($"[XY CLICK] {step.Name} at {step.X}, {step.Y}");
                                 clickX = (int)winRect.X + step.X;
                                 clickY = (int)winRect.Y + step.Y;
@@ -380,7 +440,18 @@ public class ExcelReplayerService
                             }
 
                             FlaUI.Core.Input.Mouse.Click(new System.Drawing.Point(clickX, clickY));
-                            Thread.Sleep(500); // 🔥 Give the dialog time to register the selection or click
+                            Thread.Sleep(1000); 
+
+                            // 🔥 Handle "Replace File?" dialogs (like the one in your screenshot)
+                            try {
+                                var dlg = automation.GetDesktop().FindAllChildren(automation.ConditionFactory.ByClassName("#32770")).FirstOrDefault();
+                                if (dlg != null && (dlg.Name.Contains("Save") || dlg.Name.Contains("Excel"))) {
+                                    var btn = dlg.FindFirstDescendant(automation.ConditionFactory.ByName("OK")) 
+                                           ?? dlg.FindFirstDescendant(automation.ConditionFactory.ByName("Yes"))
+                                           ?? dlg.FindFirstDescendant(automation.ConditionFactory.ByAutomationId("1"));
+                                    if (btn != null) { btn.Click(); Thread.Sleep(1000); }
+                                }
+                            } catch {}
 
                             string clickedName = targetElement?.Name ?? step.Name ?? "";
                             bool isOpenClick = step.AutomationId == "1" || clickedName == "Open";
@@ -389,8 +460,8 @@ public class ExcelReplayerService
 
                             if (isOpenClick)
                             {
-                                Log.Information("[DIALOG] Open button clicked, waiting for dialog to close...");
-                                Thread.Sleep(FlaUIRecorder.Core.Constants.Timeouts.LongWait);
+                                Log.Information("[DIALOG] Open button clicked, waiting for upload/process...");
+                                Thread.Sleep(FlaUIRecorder.Core.Constants.Timeouts.ExtraLongWait); // Increased to ExtraLongWait (8s)
                                 lastClickWasAttachFile = false;
                             }
                             else if (isAttachClick)
@@ -420,8 +491,11 @@ public class ExcelReplayerService
                                 }
                                 else
                                 {
-                                    Log.Warning("[FILE PICKER] No dialog detected");
-                                    lastClickWasAttachFile = false;
+                                    // 🔥 OUTLOOK HACK: If no dialog, it might be a dropdown. Still set flag for next click.
+                                    Log.Information("[FILE PICKER] No dialog detected - assuming dropdown phase");
+                                    lastClickWasAttachFile = true; 
+                                    lastChromeWindowRect = new System.Drawing.Rectangle((int)winRect.X, (int)winRect.Y,
+                                                                                       (int)winRect.Width, (int)winRect.Height);
                                 }
                             }
                             else if (isListItem)
@@ -440,6 +514,108 @@ public class ExcelReplayerService
                     }
                     break;
 
+                case "SelectFile":
+                    if (EnsureCurrentApp(step.AppPath, apps, automation, ref currentApp))
+                    {
+                        AutomationElement targetElement = null;
+                        var cf = automation.ConditionFactory;
+
+                        Retry.WhileTrue(() =>
+                        {
+                            try
+                            {
+                                Thread.Sleep(500); // Wait for dialog to fully open
+                                var desktop = automation.GetDesktop();
+
+                                // Look for file picker dialogs - try multiple window classes
+                                var dialogs = desktop.FindAllChildren(cf.ByClassName(FlaUIRecorder.Core.Constants.Automation.Win32DialogClass)).ToList();
+
+                                if (!dialogs.Any())
+                                {
+                                    // Try finding any window containing files
+                                    dialogs = currentApp.GetAllTopLevelWindows(automation)
+                                        .Cast<AutomationElement>()
+                                        .Where(w => !w.Properties.IsOffscreen.ValueOrDefault)
+                                        .ToList();
+                                    Log.Information($"[SELECT FILE] Found {dialogs.Count} windows in app");
+                                }
+
+                                if (dialogs.Any())
+                                {
+                                    // Search for exact filename match in list items
+                                    foreach (var dlg in dialogs)
+                                    {
+                                        var listItems = dlg.FindAllDescendants(cf.ByControlType(FlaUI.Core.Definitions.ControlType.ListItem));
+                                        targetElement = listItems.FirstOrDefault(el => el.Name == step.Name);
+
+                                        if (targetElement == null)
+                                        {
+                                            var dataItems = dlg.FindAllDescendants(cf.ByControlType(FlaUI.Core.Definitions.ControlType.DataItem));
+                                            targetElement = dataItems.FirstOrDefault(el => el.Name == step.Name);
+                                        }
+
+                                        if (targetElement != null)
+                                        {
+                                            Log.Information($"[SELECT FILE] Found in dialog: '{step.Name}'");
+                                            break;
+                                        }
+                                    }
+
+                                    if (targetElement != null)
+                                    {
+                                        Log.Information($"[SELECT FILE] Selecting: '{step.Name}'");
+                                        
+                                        // 🔥 Ensure the item is visible and selected
+                                        try
+                                        {
+                                            if (targetElement.Patterns.ScrollItem.IsSupported) 
+                                                targetElement.Patterns.ScrollItem.Pattern.ScrollIntoView();
+                                            
+                                            if (targetElement.Patterns.SelectionItem.IsSupported)
+                                                targetElement.Patterns.SelectionItem.Pattern.Select();
+                                            else
+                                                targetElement.Focus();
+                                        }
+                                        catch { targetElement.Focus(); }
+
+                                        var rect = targetElement.BoundingRectangle;
+                                        FlaUIRecorder.Core.Replayer.VisualIndicator.ShowRectangle(rect);
+                                        Thread.Sleep(FlaUIRecorder.Core.Constants.Timeouts.InteractionDelay);
+                                        
+                                        targetElement.Click();
+                                        Thread.Sleep(500); // Give UI time to update selection
+                                        return true;
+                                    }
+                                    else
+                                    {
+                                        Log.Warning($"[SELECT FILE] File '{step.Name}' not found in any window - using position click");
+                                        // Fallback: click at recorded position
+                                        var dlgWindow = dialogs.FirstOrDefault();
+                                        if (dlgWindow != null)
+                                        {
+                                            var rect = dlgWindow.BoundingRectangle;
+                                            int x = (int)rect.X + step.X;
+                                            int y = (int)rect.Y + step.Y;
+                                            Log.Information($"[SELECT FILE] Fallback click at {x},{y}");
+                                            FlaUIRecorder.Core.Replayer.VisualIndicator.ShowClick(x, y);
+                                            Thread.Sleep(FlaUIRecorder.Core.Constants.Timeouts.InteractionDelay);
+                                            FlaUI.Core.Input.Mouse.Click(new System.Drawing.Point(x, y));
+                                            return true;
+                                        }
+                                        return false;
+                                    }
+                                }
+                                else
+                                {
+                                    Log.Warning("[SELECT FILE] No dialog detected");
+                                    return false;
+                                }
+                            }
+                            catch (Exception ex) { Log.Error(ex, $"SelectFile failed for {step.Name}"); return false; }
+                        },
+                        TimeSpan.FromSeconds(isWebBasedApp ? FlaUIRecorder.Core.Constants.Timeouts.WebRetrySeconds : FlaUIRecorder.Core.Constants.Timeouts.RetrySeconds));
+                    }
+                    break;
 
                 case "Type":
                     if (EnsureCurrentApp(step.AppPath, apps, automation, ref currentApp))
@@ -518,10 +694,63 @@ public class ExcelReplayerService
                                 Thread.Sleep(FlaUIRecorder.Core.Constants.Timeouts.ClickDelay);
                             }
 
-                            // 🔥 Handle Save/Open dialogs specifically
-                            if (targetWindow.ClassName == FlaUIRecorder.Core.Constants.Automation.Win32DialogClass)
+                            // 🔥 Check for any save dialog (modern Office panel OR classic Win32)
+                            var allWinsForType = currentApp.GetAllTopLevelWindows(automation);
+                            var saveDialog = allWinsForType.FirstOrDefault(w =>
+                                (w.Name != null && w.Name.ToLower().Contains("save")) ||
+                                w.ClassName == "#32770");
+
+                            if (saveDialog != null)
                             {
-                                // 🔥 FIX: Use the correct ID for the File Name box (1148 is modern, 1001 is legacy)
+                                // 🔥 Modern Office "Save this file" dialog OR classic Win32 Save dialog
+                                saveDialog.SetForeground();
+                                Thread.Sleep(300);
+
+                                var cfType = automation.ConditionFactory;
+
+                                // Find filename Edit box — try Win32 IDs first, then any Edit control
+                                var fileNameBox =
+                                    saveDialog.FindFirstDescendant(cfType.ByAutomationId("1148")) ?? // modern Win32
+                                    saveDialog.FindFirstDescendant(cfType.ByAutomationId("1001")) ?? // legacy Win32
+                                    saveDialog.FindFirstDescendant(cfType.ByControlType(FlaUI.Core.Definitions.ControlType.Edit)); // modern Office panel
+
+                                if (fileNameBox != null)
+                                {
+                                    FlaUIRecorder.Core.Replayer.VisualIndicator.ShowRectangle(fileNameBox.BoundingRectangle);
+                                    fileNameBox.Click();
+                                    Thread.Sleep(200);
+
+                                    // 🔥 Select ALL existing text and delete it (clears default like "Book1verds")
+                                    FlaUI.Core.Input.Keyboard.Press(VirtualKeyShort.CONTROL);
+                                    FlaUI.Core.Input.Keyboard.Press(VirtualKeyShort.KEY_A);
+                                    FlaUI.Core.Input.Keyboard.Release(VirtualKeyShort.KEY_A);
+                                    FlaUI.Core.Input.Keyboard.Release(VirtualKeyShort.CONTROL);
+                                    Thread.Sleep(100);
+                                    FlaUI.Core.Input.Keyboard.Press(VirtualKeyShort.DELETE);
+                                    Thread.Sleep(100);
+                                    Log.Information("[TYPE/SAVE] Cleared existing filename");
+                                }
+                                else
+                                {
+                                    Log.Warning("[TYPE/SAVE] File name edit box not found");
+                                }
+
+                                // 🔥 Paste new filename via clipboard (avoids keyboard layout issues)
+                                if (!string.IsNullOrEmpty(step.Value))
+                                {
+                                    Clipboard.SetText(step.Value);
+                                    Thread.Sleep(100);
+                                    FlaUI.Core.Input.Keyboard.Press(VirtualKeyShort.CONTROL);
+                                    FlaUI.Core.Input.Keyboard.Press(VirtualKeyShort.KEY_V);
+                                    FlaUI.Core.Input.Keyboard.Release(VirtualKeyShort.KEY_V);
+                                    FlaUI.Core.Input.Keyboard.Release(VirtualKeyShort.CONTROL);
+                                    Thread.Sleep(200);
+                                    Log.Information($"[TYPE/SAVE] Filename set to: {step.Value}");
+                                }
+                            }
+                            else if (targetWindow.ClassName == FlaUIRecorder.Core.Constants.Automation.Win32DialogClass)
+                            {
+                                // 🔥 Fallback: Win32 dialog detected via targetWindow (not allWindows scan)
                                 var edit = targetWindow.FindFirstDescendant(automation.ConditionFactory.ByAutomationId("1148"))
                                         ?? targetWindow.FindFirstDescendant(automation.ConditionFactory.ByAutomationId("1001"));
 
@@ -533,6 +762,8 @@ public class ExcelReplayerService
                                     FlaUI.Core.Input.Keyboard.Press(VirtualKeyShort.KEY_A);
                                     FlaUI.Core.Input.Keyboard.Release(VirtualKeyShort.KEY_A);
                                     FlaUI.Core.Input.Keyboard.Release(VirtualKeyShort.CONTROL);
+                                    Thread.Sleep(100);
+                                    FlaUI.Core.Input.Keyboard.Press(VirtualKeyShort.DELETE);
                                     Thread.Sleep(FlaUIRecorder.Core.Constants.Timeouts.InteractionDelay);
                                 }
                                 if (!string.IsNullOrEmpty(step.Value))
@@ -547,6 +778,14 @@ public class ExcelReplayerService
                             }
                             else
                             {
+                                // 🔥 NEW: Clear field before typing (prevents appending)
+                                FlaUI.Core.Input.Keyboard.Press(VirtualKeyShort.CONTROL);
+                                FlaUI.Core.Input.Keyboard.Press(VirtualKeyShort.KEY_A);
+                                FlaUI.Core.Input.Keyboard.Release(VirtualKeyShort.KEY_A);
+                                FlaUI.Core.Input.Keyboard.Release(VirtualKeyShort.CONTROL);
+                                Thread.Sleep(100);
+                                FlaUI.Core.Input.Keyboard.Press(VirtualKeyShort.BACK);
+                                Thread.Sleep(200);
                                 FlaUI.Core.Input.Keyboard.Type(step.Value);
                             }
                         }
@@ -617,8 +856,48 @@ public class ExcelReplayerService
                     FlaUI.Core.Input.Keyboard.Release(VirtualKeyShort.KEY_S);
                     FlaUI.Core.Input.Keyboard.Release(VirtualKeyShort.CONTROL);
                     Thread.Sleep(FlaUIRecorder.Core.Constants.Timeouts.ExtraLongWait);
-                    break;
 
+                    // 🔥 Auto-dismiss "Replace file?" dialog (Excel shows OK/Cancel)
+                    try
+                    {
+                        var cf2 = automation.ConditionFactory;
+                        var allDesktopDialogs = automation.GetDesktop()
+                            .FindAllChildren(cf2.ByClassName("#32770")).ToList();
+
+                        var replaceDialog = allDesktopDialogs.FirstOrDefault(d =>
+                            d.Name?.Contains("Save As") == true ||
+                            d.Name?.Contains("Confirm") == true ||
+                            d.Name?.Contains("Replace") == true ||
+                            d.Name?.Contains("Excel") == true)
+                            ?? allDesktopDialogs.FirstOrDefault(); // fallback: any dialog
+
+                        if (replaceDialog != null)
+                        {
+                            var okBtn = replaceDialog.FindFirstDescendant(cf2.ByName("OK"))
+                                     ?? replaceDialog.FindFirstDescendant(cf2.ByName("Yes"))
+                                     ?? replaceDialog.FindFirstDescendant(cf2.ByName("Replace"))
+                                     ?? replaceDialog.FindFirstDescendant(cf2.ByAutomationId("6"))  // "Yes" AutomationId
+                                     ?? replaceDialog.FindFirstDescendant(cf2.ByAutomationId("1")); // "OK" AutomationId
+
+                            if (okBtn != null)
+                            {
+                                Log.Information("[SAVE] Replace dialog detected — clicking OK");
+                                okBtn.Click();
+                                Thread.Sleep(FlaUIRecorder.Core.Constants.Timeouts.LongWait);
+                            }
+                            else
+                            {
+                                Log.Information("[SAVE] Replace dialog detected — pressing Enter fallback");
+                                FlaUI.Core.Input.Keyboard.Press(VirtualKeyShort.RETURN);
+                                Thread.Sleep(FlaUIRecorder.Core.Constants.Timeouts.LongWait);
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Warning(ex, "[SAVE] Replace dialog check failed");
+                    }
+                    break;
                 case "Enter":
                     FlaUI.Core.Input.Keyboard.Press(VirtualKeyShort.RETURN);
                     Thread.Sleep(FlaUIRecorder.Core.Constants.Timeouts.ClickDelay);
@@ -636,12 +915,14 @@ public class ExcelReplayerService
                     break;
 
                 case "Close":
-                    if (EnsureCurrentApp(step.AppPath, apps, automation, ref currentApp))
+                    // 🔥 FIX: Pass launchIfMissing: false so we don't restart the app just to close it!
+                    if (EnsureCurrentApp(step.AppPath, apps, automation, ref currentApp, launchIfMissing: false))
                     {
                         var win = currentApp.GetMainWindow(automation);
                         if (win != null)
                         {
                             win.SetForeground();
+                            Thread.Sleep(FlaUIRecorder.Core.Constants.Timeouts.LongWait); // Give time for final actions
                             FlaUI.Core.Input.Keyboard.Press(VirtualKeyShort.ALT);
                             FlaUI.Core.Input.Keyboard.Press(VirtualKeyShort.F4);
                             FlaUI.Core.Input.Keyboard.Release(VirtualKeyShort.F4);

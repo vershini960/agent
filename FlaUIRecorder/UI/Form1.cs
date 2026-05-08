@@ -38,6 +38,7 @@ namespace FlaUIRecorder.UI
             lblReplayTime.Text = $"Replay Time: {elapsed.ToString(@"hh\:mm\:ss")}";
         }
         private bool isRecording = false;
+        private bool isReplaying = false;
 
         private async void btnStart_Click(object sender, EventArgs e)
         {
@@ -76,6 +77,15 @@ namespace FlaUIRecorder.UI
 
         private void btnReplay_Click(object sender, EventArgs e)
         {
+            if (isReplaying) return;
+
+            // 🔥 CRITICAL: If we are recording, STOP IT before replaying.
+            // Otherwise, the recorder will capture the replay, leading to a loop of steps.
+            if (isRecording)
+            {
+                btnStop_Click(sender, e);
+            }
+
             var steps = storage.Load(FlaUIRecorder.Core.Constants.App.DefaultStepsFile);
 
             if (steps == null || steps.Count == 0)
@@ -84,19 +94,27 @@ namespace FlaUIRecorder.UI
                 return;
             }
 
-            // FIX: UIA3/COM requires an STA thread — Task.Run uses MTA thread pool
+            isReplaying = true;
+            button3.Enabled = false;
             replayStartTime = DateTime.Now;
             lblReplayTime.Text = "Replay Time: 00:00:00";
             replayingTimer.Start();
 
             var thread = new Thread(() =>
             {
-                replayer.Play(steps);
-
-                
-                this.Invoke((MethodInvoker)delegate {
-                    replayingTimer.Stop();
-                });
+                try
+                {
+                    replayer.Play(steps);
+                }
+                finally
+                {
+                    this.Invoke((MethodInvoker)delegate {
+                        replayingTimer.Stop();
+                        isReplaying = false;
+                        button3.Enabled = true;
+                        MessageBox.Show("Replay finished");
+                    });
+                }
             });
             thread.SetApartmentState(ApartmentState.STA);
             thread.IsBackground = true;

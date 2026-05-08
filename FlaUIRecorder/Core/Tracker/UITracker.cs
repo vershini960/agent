@@ -105,15 +105,25 @@ public class UITracker
         string automationId = Safe(() => element.AutomationId);
         string name = Safe(() => element.Name);
 
-        // 🔥 FIX: If the name is generic (like "Name" or "System.ItemNameDisplay"), 
-        // try to get the real filename from the parent ListItem or the Value property.
-        if (string.IsNullOrEmpty(name) || name == "Name" || automationId?.Contains("ItemName") == true)
+        // 🔥 FIX: If we are inside a ListItem or DataItem (like a file dialog), 
+        // ALWAYS climb up to the parent list item to get the real filename/name.
+        // This prevents capturing generic names like "Date modified" or "Name".
+        var current = element;
+        while (current != null)
         {
-            var parent = element.Parent;
-            if (parent != null && (parent.ControlType == FlaUI.Core.Definitions.ControlType.ListItem || parent.ControlType == FlaUI.Core.Definitions.ControlType.DataItem))
+            var ct2 = current.Properties.ControlType.ValueOrDefault;
+            if (ct2 == FlaUI.Core.Definitions.ControlType.ListItem || ct2 == FlaUI.Core.Definitions.ControlType.DataItem)
             {
-                name = Safe(() => parent.Name);
+                string parentName = Safe(() => current.Name);
+                if (!string.IsNullOrEmpty(parentName))
+                {
+                    name = parentName;
+                    break;
+                }
             }
+            // Don't climb above the window
+            if (ct2 == FlaUI.Core.Definitions.ControlType.Window) break;
+            current = current.Parent;
         }
 
         var ct = element.Properties.ControlType.ValueOrDefault;
